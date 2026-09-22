@@ -15,6 +15,7 @@
     "tabs",
     "webRequest",
     "scripting",
+    "debugger",
     "declarativeNetRequest",
     "sidePanel"
   ],

@@ -734,6 +734,121 @@ async function connectToAgent() {
             sendToAgent({ id: msg.id, result: results?.[0]?.result });
             return;
           }
+          if (msg.params?.probeType === 'inspect_input_box') {
+            const tab = (await getAnyFlowTab()) || (await getOrOpenFlowTab());
+            if (!tab) {
+              sendToAgent({ id: msg.id, error: 'NO_FLOW_TAB' });
+              return;
+            }
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              world: 'MAIN',
+              func: () => {
+                const editor = document.querySelector('.ProseMirror, [contenteditable="true"]');
+                const genBtn = document.querySelector('.generate-icon-button, [aria-label*="generation" i], button:has(mat-icon)');
+                const allGenBtns = Array.from(document.querySelectorAll('button')).filter(b => 
+                  b.innerText?.includes('arrow_forward') || 
+                  b.getAttribute('aria-label')?.toLowerCase().includes('generation') ||
+                  b.className?.includes('generate')
+                );
+                return {
+                  editorTag: editor?.tagName,
+                  editorHtml: editor?.outerHTML?.slice(0, 300),
+                  editorParentHtml: editor?.parentElement?.outerHTML?.slice(0, 300),
+                  allGenBtns: allGenBtns.map(b => ({
+                    html: b.outerHTML?.slice(0, 200),
+                    disabled: b.disabled,
+                    aria: b.getAttribute('aria-label'),
+                    rect: b.getBoundingClientRect()
+                  }))
+                };
+              }
+            });
+            sendToAgent({ id: msg.id, result: results?.[0]?.result });
+            return;
+          }
+          if (msg.params?.probeType === 'test_click_submit') {
+            const tab = (await getAnyFlowTab()) || (await getOrOpenFlowTab());
+            if (!tab) {
+              sendToAgent({ id: msg.id, error: 'NO_FLOW_TAB' });
+              return;
+            }
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              world: 'MAIN',
+              func: () => {
+                const btn = document.querySelector('.generate-icon-button, [aria-label*="generation" i]');
+                const editor = document.querySelector('.ProseMirror');
+                editor?.focus();
+                if (!btn) return { error: 'NO_BTN' };
+                const rect = btn.getBoundingClientRect();
+                return {
+                  x: rect.x + rect.width / 2,
+                  y: rect.y + rect.height / 2,
+                  editorText: editor?.innerText?.trim()
+                };
+              }
+            });
+            const info = results?.[0]?.result;
+            let clickResult = false;
+            if (info && info.x && info.y) {
+              clickResult = await sendTrustedClick(tab.id, info.x, info.y);
+            }
+            sendToAgent({ id: msg.id, result: { info, clickResult } });
+            return;
+          }
+
+          if (msg.params?.probeType === 'install_spy') {
+            const tab = (await getAnyFlowTab()) || (await getOrOpenFlowTab());
+            if (!tab) {
+              sendToAgent({ id: msg.id, error: 'NO_FLOW_TAB' });
+              return;
+            }
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              world: 'MAIN',
+              func: () => {
+                window.__FLOW_EVENT_LOG__ = window.__FLOW_EVENT_LOG__ || [];
+                const types = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'keydown'];
+                for (const t of types) {
+                  window.addEventListener(t, (e) => {
+                    const path = e.composedPath ? e.composedPath().map(el => el.tagName || el.nodeName || '').filter(Boolean) : [];
+                    window.__FLOW_EVENT_LOG__.push({
+                      type: e.type,
+                      targetTag: e.target?.tagName,
+                      targetClass: e.target?.className,
+                      isTrusted: e.isTrusted,
+                      x: e.clientX,
+                      y: e.clientY,
+                      key: e.key,
+                      path: path.slice(0, 8),
+                      time: Date.now()
+                    });
+                    if (window.__FLOW_EVENT_LOG__.length > 50) window.__FLOW_EVENT_LOG__.shift();
+                  }, { capture: true });
+                }
+                return { installed: true };
+              }
+            });
+            sendToAgent({ id: msg.id, result: results?.[0]?.result });
+            return;
+          }
+          if (msg.params?.probeType === 'get_spy_log') {
+            const tab = (await getAnyFlowTab()) || (await getOrOpenFlowTab());
+            if (!tab) {
+              sendToAgent({ id: msg.id, error: 'NO_FLOW_TAB' });
+              return;
+            }
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              world: 'MAIN',
+              func: () => {
+                return { logs: window.__FLOW_EVENT_LOG__ || [] };
+              }
+            });
+            sendToAgent({ id: msg.id, result: results?.[0]?.result });
+            return;
+          }
           if (msg.params?.probeType === 'inspect_recent') {
             const tab = (await getAnyFlowTab()) || (await getOrOpenFlowTab());
             if (!tab) {
@@ -1533,7 +1648,7 @@ async function handleApiRequest(msg) {
 
             // 3. Find generate button and wait if disabled
             let generateButton = null;
-            for (let i = 0; i < 10; i++) {
+            for (let i = 0; i < 15; i++) {
               generateButton = Array.from(document.querySelectorAll('button')).find(b => 
                 b.innerText?.includes('arrow_forward') || 
                 b.getAttribute('aria-label')?.toLowerCase().includes('generate')
@@ -1546,14 +1661,53 @@ async function handleApiRequest(msg) {
               return { ok: false, error: 'BUTTON_DISABLED_OR_MISSING' };
             }
 
-            // 4. Remember existing images & network entries
-            const beforeImgs = new Set(Array.from(document.querySelectorAll('img')).map(i => i.src));
-            const beforePerf = new Set(performance.getEntriesByType('resource').map(r => r.name));
+            // Scroll button into view to get exact viewport coordinates
+            generateButton.scrollIntoView({ block: 'center', inline: 'center' });
+            await new Promise(r => setTimeout(r, 100));
 
-            // 5. Click generate!
-            generateButton.click();
+            const rect = generateButton.getBoundingClientRect();
+            const clickX = rect.left + rect.width / 2;
+            const clickY = rect.top + rect.height / 2;
 
-            // 6. Poll for new image
+            // Remember existing images & network entries
+            const beforeImgs = Array.from(document.querySelectorAll('img')).map(i => i.src);
+            const beforePerf = performance.getEntriesByType('resource').map(r => r.name);
+
+            return {
+              ok: true,
+              x: clickX,
+              y: clickY,
+              beforeImgs,
+              beforePerf
+            };
+          } catch (e) {
+            return { ok: false, error: e.message };
+          }
+        },
+        args: [prompt, aspect]
+      });
+
+      const prepRes = execResults?.[0]?.result;
+      if (!prepRes?.ok) {
+        metrics.failedCount++;
+        metrics.lastError = prepRes?.error || 'PREPARE_FAILED';
+        chrome.storage.local.set({ metrics });
+        sendToAgent({ id, status: 500, error: prepRes?.error || 'PREPARE_FAILED' });
+        setState('idle');
+        return;
+      }
+
+      // Send trusted hardware click via chrome.debugger
+      await sendTrustedClick(tab.id, prepRes.x, prepRes.y);
+
+      // Poll for new image
+      const pollResults = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        func: async (beforeImgsArr, beforePerfArr) => {
+          try {
+            const beforeImgs = new Set(beforeImgsArr || []);
+            const beforePerf = new Set(beforePerfArr || []);
             let newImageSrc = null;
             for (let i = 0; i < 60; i++) {
               await new Promise(r => setTimeout(r, 1000));
@@ -1586,10 +1740,13 @@ async function handleApiRequest(msg) {
                 break;
               }
 
-              // Check for UI error toasts
-              const errorToast = document.querySelector('mat-snack-bar-container, [role="alert"], .error-message');
+              // Check for UI error toasts (only active floating snackbars)
+              const errorToast = document.querySelector('mat-snack-bar-container .mdc-snackbar__label, mat-snack-bar-container');
               if (errorToast && errorToast.innerText?.trim()) {
-                return { ok: false, error: errorToast.innerText.trim() };
+                const toastText = errorToast.innerText.trim();
+                if (toastText.toLowerCase().includes('failed') || toastText.toLowerCase().includes('error') || toastText.toLowerCase().includes('unusual')) {
+                  return { ok: false, error: toastText };
+                }
               }
             }
 
@@ -1607,10 +1764,10 @@ async function handleApiRequest(msg) {
             return { ok: false, error: e.message };
           }
         },
-        args: [prompt, aspect]
+        args: [prepRes.beforeImgs, prepRes.beforePerf]
       });
 
-      const genRes = execResults?.[0]?.result;
+      const genRes = pollResults?.[0]?.result;
       if (genRes?.ok && genRes.imageUrl) {
         metrics.successCount++;
         chrome.storage.local.set({ metrics });
@@ -2057,6 +2214,92 @@ function handleTrpcMediaUrls(trpcUrl, bodyText) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function sendTrustedClick(tabId, x, y) {
+  let alreadyAttached = false;
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+  } catch (err) {
+    if (err.message?.includes('already attached')) {
+      alreadyAttached = true;
+    } else {
+      console.warn('[Flow Agent] Debugger attach error:', err.message);
+      return false;
+    }
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mouseMoved',
+      x: Math.round(x),
+      y: Math.round(y)
+    });
+    await sleep(30);
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      clickCount: 1
+    });
+    await sleep(60);
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: Math.round(x),
+      y: Math.round(y),
+      button: 'left',
+      clickCount: 1
+    });
+    await sleep(50);
+    return true;
+  } catch (e) {
+    console.warn('[Flow Agent] Trusted click dispatch error:', e.message);
+    return false;
+  } finally {
+    if (!alreadyAttached) {
+      try { await chrome.debugger.detach({ tabId }); } catch {}
+    }
+  }
+}
+
+async function sendTrustedEnter(tabId) {
+  let alreadyAttached = false;
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+  } catch (err) {
+    if (err.message?.includes('already attached')) {
+      alreadyAttached = true;
+    } else {
+      console.warn('[Flow Agent] Debugger attach error:', err.message);
+      return false;
+    }
+  }
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'rawKeyDown',
+      key: 'Enter',
+      code: 'Enter',
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13
+    });
+    await sleep(50);
+    await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchKeyEvent', {
+      type: 'keyUp',
+      key: 'Enter',
+      code: 'Enter',
+      windowsVirtualKeyCode: 13,
+      nativeVirtualKeyCode: 13
+    });
+    await sleep(50);
+    return true;
+  } catch (e) {
+    console.warn('[Flow Agent] Trusted enter dispatch error:', e.message);
+    return false;
+  } finally {
+    if (!alreadyAttached) {
+      try { await chrome.debugger.detach({ tabId }); } catch {}
+    }
+  }
 }
 
 // ─── Human-like Telemetry ──────────────────────────────────
